@@ -1,0 +1,237 @@
+name: Collect Pune Raw Data
+
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    name: Collect Raw Pune Data
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 350
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+
+      # ======================================================
+      # CHECKOUT
+      # ======================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # ======================================================
+      # SYSTEM INFO
+      # ======================================================
+
+      - name: System information
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "PUNE RAW DATA COLLECTION"
+          echo "========================================"
+
+          echo
+          echo "Repository:"
+          echo "$GITHUB_REPOSITORY"
+
+          echo
+          echo "Branch:"
+          echo "$GITHUB_REF"
+
+          echo
+          echo "CPU:"
+          nproc
+
+          echo
+          echo "RAM:"
+          free -h
+
+          echo
+          echo "DISK:"
+          df -h
+
+      # ======================================================
+      # PYTHON
+      # ======================================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ======================================================
+      # TOOLS
+      # ======================================================
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            curl \
+            ca-certificates
+
+          python --version
+          pip --version
+
+          gh --version | head -n 1
+          curl --version | head -n 1
+
+      # ======================================================
+      # PYTHON DEPENDENCIES
+      # ======================================================
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -e
+
+          python -m pip install \
+            --upgrade \
+            pip
+
+          python -m pip install \
+            -r requirements.txt
+
+      # ======================================================
+      # DIRECTORIES
+      # ======================================================
+
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p data/raw/osm
+          mkdir -p data/raw/dem
+          mkdir -p data/raw/opencity
+          mkdir -p release
+
+      # ======================================================
+      # RELEASE
+      # ======================================================
+
+      - name: Create or verify GitHub Release
+        shell: bash
+        run: |
+          set -e
+
+          TAG="pune-raw-v1"
+          TITLE="Pune Raw Open Data v1"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+
+            echo "Release already exists:"
+            echo "$TAG"
+
+          else
+
+            echo "Creating release..."
+
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes \
+              "Pune Raw Open Data collected from free/open data sources."
+
+            echo "Release created."
+
+          fi
+
+      # ======================================================
+      # PYTHON SYNTAX CHECK
+      # ======================================================
+
+      - name: Validate Python
+        shell: bash
+        run: |
+          set -e
+
+          python -m py_compile collector.py
+
+          echo
+          echo "Python syntax validation passed."
+
+      # ======================================================
+      # RUN COLLECTOR
+      # ======================================================
+
+      - name: Run Python collector
+        shell: bash
+        run: |
+          set -e
+
+          python collector.py
+
+      # ======================================================
+      # RELEASE ASSETS
+      # ======================================================
+
+      - name: Verify GitHub Release
+        if: always()
+        shell: bash
+        run: |
+          echo
+          echo "========================================"
+          echo "RELEASE ASSETS"
+          echo "========================================"
+
+          gh release view pune-raw-v1 \
+            --json assets \
+            --jq \
+            '.assets[] | "\(.name)  \(.size) bytes"'
+
+      # ======================================================
+      # FINAL REPORT
+      # ======================================================
+
+      - name: Final report
+        if: always()
+        shell: bash
+        run: |
+
+          echo
+          echo "========================================"
+          echo "FINAL DISK"
+          echo "========================================"
+
+          df -h
+
+          echo
+          echo "========================================"
+          echo "RAW DATA"
+          echo "========================================"
+
+          du -sh data/raw 2>/dev/null || true
+
+          echo
+          echo "OSM:"
+          ls -lh data/raw/osm 2>/dev/null || true
+
+          echo
+          echo "DEM:"
+          ls -lh data/raw/dem 2>/dev/null || true
+
+          echo
+          echo "OPENCITY:"
+          find data/raw/opencity \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p  %s bytes\n' \
+            2>/dev/null || true
+
+          echo
+          echo "========================================"
+          echo "COLLECTION FINISHED"
+          echo "========================================"
