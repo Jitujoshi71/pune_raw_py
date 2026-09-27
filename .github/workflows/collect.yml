@@ -1,15 +1,15 @@
-name: Collect Pune Raw Data
+name: Build Pune Raw Data
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   collect:
-    name: Collect Raw Pune Data
+    name: Fresh Pune Raw Data
     runs-on: ubuntu-latest
-
     timeout-minutes: 350
 
     env:
@@ -24,8 +24,8 @@ jobs:
       # CHECKOUT
       # ======================================================
 
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v4
 
       # ======================================================
       # SYSTEM INFO
@@ -34,17 +34,19 @@ jobs:
       - name: System information
         shell: bash
         run: |
-          echo "========================================"
-          echo "PUNE RAW DATA COLLECTION"
-          echo "========================================"
+          set -e
+
+          echo "=============================================="
+          echo "PUNE RAW DATA BUILD"
+          echo "=============================================="
 
           echo
           echo "Repository:"
           echo "$GITHUB_REPOSITORY"
 
           echo
-          echo "Branch:"
-          echo "$GITHUB_REF"
+          echo "Commit:"
+          git rev-parse HEAD
 
           echo
           echo "CPU:"
@@ -63,34 +65,45 @@ jobs:
       # ======================================================
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       # ======================================================
-      # TOOLS
+      # SYSTEM TOOLS
       # ======================================================
 
-      - name: Install tools
+      - name: Install system tools
         shell: bash
         run: |
           set -e
 
+          echo "=============================================="
+          echo "INSTALLING TOOLS"
+          echo "=============================================="
+
           sudo apt-get update
 
           sudo apt-get install -y \
+            osmium-tool \
             curl \
             ca-certificates
 
-          python --version
-          pip --version
+          echo
+          echo "OSMIUM:"
+          osmium --version
 
+          echo
+          echo "GH:"
           gh --version | head -n 1
-          curl --version | head -n 1
+
+          echo
+          echo "PYTHON:"
+          python --version
 
       # ======================================================
-      # PYTHON DEPENDENCIES
+      # DEPENDENCIES
       # ======================================================
 
       - name: Install Python dependencies
@@ -106,7 +119,7 @@ jobs:
             -r requirements.txt
 
       # ======================================================
-      # DIRECTORIES
+      # DIRECTORY
       # ======================================================
 
       - name: Prepare directories
@@ -114,43 +127,18 @@ jobs:
         run: |
           set -e
 
+          rm -rf data
+          rm -rf release
+
+          mkdir -p data/raw/source
           mkdir -p data/raw/osm
           mkdir -p data/raw/dem
           mkdir -p data/raw/opencity
+          mkdir -p data/tmp
           mkdir -p release
 
       # ======================================================
-      # RELEASE
-      # ======================================================
-
-      - name: Create or verify GitHub Release
-        shell: bash
-        run: |
-          set -e
-
-          TAG="pune-raw-v1"
-          TITLE="Pune Raw Open Data v1"
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
-
-            echo "Release already exists:"
-            echo "$TAG"
-
-          else
-
-            echo "Creating release..."
-
-            gh release create "$TAG" \
-              --title "$TITLE" \
-              --notes \
-              "Pune Raw Open Data collected from free/open data sources."
-
-            echo "Release created."
-
-          fi
-
-      # ======================================================
-      # PYTHON SYNTAX CHECK
+      # SYNTAX
       # ======================================================
 
       - name: Validate Python
@@ -161,77 +149,129 @@ jobs:
           python -m py_compile collector.py
 
           echo
-          echo "Python syntax validation passed."
+          echo "Python syntax validation PASSED."
 
       # ======================================================
-      # RUN COLLECTOR
+      # RUN
       # ======================================================
 
-      - name: Run Python collector
+      - name: Run fresh collector
         shell: bash
         run: |
           set -e
 
+          echo "=============================================="
+          echo "STARTING FRESH COLLECTOR"
+          echo "=============================================="
+
           python collector.py
+
+      # ======================================================
+      # FINAL VALIDATION
+      # ======================================================
+
+      - name: Validate final release
+        shell: bash
+        run: |
+          set -e
+
+          echo "=============================================="
+          echo "FINAL VALIDATION"
+          echo "=============================================="
+
+          test -s data/raw/osm/central-zone.osm.pbf
+          test -s data/raw/dem/N18E073.hgt.gz
+          test -s data/raw/dem/N18E074.hgt.gz
+          test -s data/raw/dem/N19E073.hgt.gz
+          test -s data/raw/dem/N19E074.hgt.gz
+
+          test -s release/manifest.json
+          test -s release/SHA256SUMS.txt
+
+          echo
+          echo "PUNE OSM:"
+          ls -lh \
+            data/raw/osm/central-zone.osm.pbf
+
+          echo
+          echo "DEM:"
+          ls -lh \
+            data/raw/dem/
+
+          echo
+          echo "MANIFEST:"
+          ls -lh \
+            release/manifest.json \
+            release/SHA256SUMS.txt
+
+          echo
+          echo "OSM FILEINFO:"
+          osmium fileinfo \
+            --extended \
+            data/raw/osm/central-zone.osm.pbf
 
       # ======================================================
       # RELEASE ASSETS
       # ======================================================
 
-      - name: Verify GitHub Release
+      - name: Show release assets
         if: always()
         shell: bash
         run: |
           echo
-          echo "========================================"
-          echo "RELEASE ASSETS"
-          echo "========================================"
+          echo "=============================================="
+          echo "GITHUB RELEASE ASSETS"
+          echo "=============================================="
 
-          gh release view pune-raw-v1 \
+          gh release view \
+            pune-raw-v1 \
             --json assets \
             --jq \
-            '.assets[] | "\(.name)  \(.size) bytes"'
+            '.assets[] |
+            "\(.name)  \(.size) bytes"'
 
       # ======================================================
-      # FINAL REPORT
+      # DISK REPORT
       # ======================================================
 
-      - name: Final report
+      - name: Final disk report
         if: always()
         shell: bash
         run: |
-
           echo
-          echo "========================================"
+          echo "=============================================="
           echo "FINAL DISK"
-          echo "========================================"
+          echo "=============================================="
 
           df -h
 
           echo
-          echo "========================================"
-          echo "RAW DATA"
-          echo "========================================"
-
-          du -sh data/raw 2>/dev/null || true
+          echo "RAW DATA:"
+          du -sh \
+            data/raw \
+            2>/dev/null || true
 
           echo
           echo "OSM:"
-          ls -lh data/raw/osm 2>/dev/null || true
+          ls -lh \
+            data/raw/osm \
+            2>/dev/null || true
 
           echo
           echo "DEM:"
-          ls -lh data/raw/dem 2>/dev/null || true
+          ls -lh \
+            data/raw/dem \
+            2>/dev/null || true
 
           echo
           echo "OPENCITY:"
           find data/raw/opencity \
-            -maxdepth 2 \
             -type f \
-            -printf '%p  %s bytes\n' \
+            -printf \
+            '%p  %s bytes\n' \
             2>/dev/null || true
 
           echo
-          echo "========================================"
-          echo "COLLECTION FINISHED"
-          echo "========================================"
+          echo "=============================================="
+          echo "WORKFLOW FINISHED"
+          echo "=============================================="
