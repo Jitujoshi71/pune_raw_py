@@ -14,64 +14,98 @@ from urllib.parse import urlparse
 import requests
 
 
-VERSION = "2.1"
+# ============================================================
+# CONFIG
+# ============================================================
+
+VERSION = "2.2"
 
 RELEASE_TAG = "pune-raw-v1"
 RELEASE_NAME = "Pune Raw Open Data v1"
 
 PUNE_BBOX = (
-    73.70,
-    18.40,
-    74.05,
-    18.70,
+    73.70,  # min lon
+    18.40,  # min lat
+    74.05,  # max lon
+    18.70,  # max lat
 )
 
-BASE_DIR = Path("data/raw")
-
-SOURCE_DIR = BASE_DIR / "source"
-OSM_DIR = BASE_DIR / "osm"
-DEM_DIR = BASE_DIR / "dem"
-OPENCITY_DIR = BASE_DIR / "opencity"
-
-RELEASE_DIR = Path("release")
-TMP_DIR = Path("data/tmp")
-
+# Pune is in Western Zone, NOT Central Zone.
 WESTERN_ZONE_URL = (
-    "https://download.geofabrik.de/"
-    "asia/india/western-zone-latest.osm.pbf"
-)
-
-SOURCE_OSM = (
-    SOURCE_DIR /
+    "https://download.geofabrik.de/asia/india/"
     "western-zone-latest.osm.pbf"
 )
 
-FINAL_OSM_NAME = "central-zone.osm.pbf"
-
-FINAL_OSM = (
-    OSM_DIR /
-    FINAL_OSM_NAME
+PUNE_OSM_PATH = Path(
+    "data/raw/osm/central-zone.osm.pbf"
 )
 
-DEM_BASE_URL = (
-    "https://s3.amazonaws.com/"
-    "elevation-tiles-prod/skadi"
+SOURCE_OSM_PATH = Path(
+    "data/raw/source/western-zone-latest.osm.pbf"
 )
 
-DEM_TILES = [
-    "N18E073",
-    "N18E074",
-    "N19E073",
-    "N19E074",
-]
+TMP_DIR = Path("data/tmp")
+
+DEM_DIR = Path("data/raw/dem")
+
+OPENCITY_DIR = Path("data/raw/opencity")
+
+MANIFEST_PATH = Path("data/manifest.json")
+
+CHECKSUM_PATH = Path("data/SHA256SUMS.txt")
+
+DIAGNOSTIC_PATH = (
+    TMP_DIR / "pune-diagnostic.geojsonseq"
+)
+
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+REQUEST_TIMEOUT = 120
+
+MAX_DOWNLOAD_RETRIES = 5
+
+MIN_PUNE_OSM_SIZE = 1024 * 1024
+
+MIN_EXPECTED_NODES = 1000
+
+MIN_EXPECTED_WAYS = 100
+
+MIN_EXPECTED_RELATIONS = 1
+
+
+# ============================================================
+# DEM
+# ============================================================
+
+DEM_TILES = {
+    "N18E073": (
+        "https://s3.amazonaws.com/elevation-tiles-prod/"
+        "skadi/N18/N18E073.hgt.gz"
+    ),
+    "N18E074": (
+        "https://s3.amazonaws.com/elevation-tiles-prod/"
+        "skadi/N18/N18E074.hgt.gz"
+    ),
+    "N19E073": (
+        "https://s3.amazonaws.com/elevation-tiles-prod/"
+        "skadi/N19/N19E073.hgt.gz"
+    ),
+    "N19E074": (
+        "https://s3.amazonaws.com/elevation-tiles-prod/"
+        "skadi/N19/N19E074.hgt.gz"
+    ),
+}
+
+
+# ============================================================
+# OPENCITY
+# ============================================================
 
 OPENCITY_API = (
     "https://data.opencity.in/api/3/action/package_search"
 )
 
-OPENCITY_ORG = (
-    "pune-municipal-corporation"
-)
+OPENCITY_ORG = "pune-municipal-corporation"
 
 ALLOWED_FORMATS = {
     "CSV",
@@ -88,167 +122,95 @@ ALLOWED_FORMATS = {
     "PDF",
 }
 
-MAX_RETRIES = 5
-
-CONNECT_TIMEOUT = 60
-READ_TIMEOUT = 1800
-
-CHUNK_SIZE = 1024 * 1024
-
-MAX_DOWNLOAD_SIZE = (
-    2 * 1024 * 1024 * 1024
-)
-
-session = requests.Session()
-
-session.headers.update(
-    {
-        "User-Agent":
-            "PuneRawCollector/2.1 "
-            "(open-data project)",
-    }
-)
-
 
 # ============================================================
-# DIRECTORIES
-# ============================================================
-
-for directory in (
-    SOURCE_DIR,
-    OSM_DIR,
-    DEM_DIR,
-    OPENCITY_DIR,
-    RELEASE_DIR,
-    TMP_DIR,
-):
-    directory.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-# ============================================================
-# LOGGING
+# HELPERS
 # ============================================================
 
 def log(message=""):
     print(message, flush=True)
 
 
-def fail(message):
-    log()
+def section(title):
     log("=" * 70)
-    log("ERROR")
+    log(title)
     log("=" * 70)
-    log(message)
-    sys.exit(1)
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+def run_command(
+    command,
+    check=True,
+    capture_output=False,
+):
+    log("$ " + " ".join(str(x) for x in command))
 
-def human_size(size):
-    value = float(size)
+    result = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        capture_output=capture_output,
+    )
 
-    for unit in (
-        "B",
-        "KiB",
-        "MiB",
-        "GiB",
-        "TiB",
-    ):
-        if value < 1024:
-            return f"{value:.2f} {unit}"
+    if check and result.returncode != 0:
+        log(
+            f"Command failed with exit code "
+            f"{result.returncode}"
+        )
 
-        value /= 1024
+        if capture_output:
+            if result.stdout:
+                log(result.stdout)
 
-    return f"{value:.2f} PiB"
+            if result.stderr:
+                log(result.stderr)
+
+        raise RuntimeError(
+            f"Command failed: {' '.join(map(str, command))}"
+        )
+
+    return result
+
+
+def ensure_directory(path):
+    Path(path).mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
 
 def sha256_file(path):
     digest = hashlib.sha256()
 
-    with path.open(
-        "rb"
-    ) as file:
-
+    with open(path, "rb") as f:
         while True:
-
-            chunk = file.read(
-                CHUNK_SIZE
-            )
+            chunk = f.read(8 * 1024 * 1024)
 
             if not chunk:
                 break
 
-            digest.update(
-                chunk
-            )
+            digest.update(chunk)
 
     return digest.hexdigest()
 
 
-def safe_filename(
-    url,
-    fallback,
-):
-    parsed = urlparse(url)
+def human_size(size):
+    size = float(size)
 
-    name = Path(
-        parsed.path
-    ).name.strip()
+    units = [
+        "B",
+        "KiB",
+        "MiB",
+        "GiB",
+        "TiB",
+    ]
 
-    if not name:
-        return fallback
+    for unit in units:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
 
-    return re.sub(
-        r"[^A-Za-z0-9._-]+",
-        "_",
-        name,
-    )[:180]
+        size /= 1024
 
-
-def run_command(
-    command,
-    description=None,
-):
-    if description:
-        log()
-        log("=" * 70)
-        log(description)
-        log("=" * 70)
-
-    log(
-        "$ " +
-        " ".join(
-            str(x)
-            for x in command
-        )
-    )
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    if result.stdout:
-        print(
-            result.stdout,
-            end="",
-            flush=True,
-        )
-
-    if result.returncode != 0:
-        fail(
-            "Command failed with "
-            f"exit code {result.returncode}"
-        )
-
-    return result.stdout
+    return f"{size:.2f} PiB"
 
 
 # ============================================================
@@ -257,175 +219,153 @@ def run_command(
 
 def download_file(
     url,
-    output,
+    output_path,
+    retries=MAX_DOWNLOAD_RETRIES,
 ):
-    output.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    output_path = Path(output_path)
 
-    part = Path(
-        str(output) + ".part"
-    )
+    ensure_directory(output_path.parent)
 
-    log()
-    log("=" * 70)
-    log("DOWNLOAD")
-    log("=" * 70)
+    section("DOWNLOAD")
 
-    log(
-        f"URL: {url}"
-    )
+    log(f"URL: {url}")
+    log(f"OUT: {output_path}")
 
-    log(
-        f"OUT: {output}"
-    )
+    last_error = None
 
     for attempt in range(
         1,
-        MAX_RETRIES + 1,
+        retries + 1,
     ):
+        log(
+            f"Attempt {attempt}/{retries}"
+        )
+
+        temp_path = output_path.with_suffix(
+            output_path.suffix + ".part"
+        )
 
         try:
+            if temp_path.exists():
+                temp_path.unlink()
 
-            if part.exists():
-                part.unlink()
-
-            log(
-                f"Attempt "
-                f"{attempt}/{MAX_RETRIES}"
-            )
-
-            with session.get(
+            with requests.get(
                 url,
                 stream=True,
-                timeout=(
-                    CONNECT_TIMEOUT,
-                    READ_TIMEOUT,
-                ),
+                timeout=REQUEST_TIMEOUT,
+                headers={
+                    "User-Agent":
+                        "PuneRawCollector/2.2"
+                },
             ) as response:
 
                 response.raise_for_status()
 
-                content_length = (
-                    response.headers.get(
-                        "Content-Length"
-                    )
+                total = response.headers.get(
+                    "Content-Length"
                 )
 
-                if content_length:
+                total_bytes = (
+                    int(total)
+                    if total and total.isdigit()
+                    else None
+                )
 
-                    expected = int(
-                        content_length
-                    )
-
+                if total_bytes:
                     log(
                         "Expected size: "
-                        + human_size(
-                            expected
-                        )
+                        f"{human_size(total_bytes)}"
                     )
 
                 downloaded = 0
+                last_report = 0
 
-                with part.open(
-                    "wb"
-                ) as file:
+                with open(
+                    temp_path,
+                    "wb",
+                ) as f:
 
                     for chunk in response.iter_content(
-                        chunk_size=CHUNK_SIZE
+                        chunk_size=DOWNLOAD_CHUNK_SIZE
                     ):
-
                         if not chunk:
                             continue
 
-                        file.write(
-                            chunk
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        mb = downloaded // (
+                            100 * 1024 * 1024
                         )
 
-                        downloaded += (
-                            len(chunk)
-                        )
+                        if mb > last_report:
+                            last_report = mb
 
-                        if (
-                            downloaded
-                            % (
-                                100
-                                * 1024
-                                * 1024
-                            )
-                            < len(chunk)
-                        ):
                             log(
                                 "Downloaded: "
-                                + human_size(
-                                    downloaded
-                                )
+                                f"{human_size(downloaded)}"
                             )
 
-            if not part.exists():
+            if not temp_path.exists():
                 raise RuntimeError(
-                    "Partial file missing."
+                    "Temporary download file "
+                    "was not created."
                 )
 
-            size = part.stat().st_size
+            actual_size = temp_path.stat().st_size
 
-            if size <= 0:
+            if actual_size <= 0:
                 raise RuntimeError(
                     "Downloaded file is empty."
                 )
 
             if (
-                size >
-                MAX_DOWNLOAD_SIZE
+                total_bytes
+                and actual_size != total_bytes
             ):
                 raise RuntimeError(
-                    "Downloaded file exceeds "
-                    "maximum allowed size."
+                    "Downloaded size mismatch: "
+                    f"expected {total_bytes}, "
+                    f"got {actual_size}"
                 )
 
-            part.replace(
-                output
-            )
+            temp_path.replace(output_path)
 
+            log("DOWNLOAD SUCCESS")
             log(
-                "DOWNLOAD SUCCESS"
+                f"Size: {human_size(actual_size)}"
             )
 
-            log(
-                f"Size: "
-                f"{human_size(size)}"
-            )
-
-            return
+            return output_path
 
         except Exception as exc:
+            last_error = exc
 
             log(
                 f"Download failed: {exc}"
             )
 
-            if part.exists():
-                part.unlink()
+            if temp_path.exists():
+                temp_path.unlink()
 
-            if attempt < MAX_RETRIES:
-
-                wait = min(
-                    30 * attempt,
-                    120,
+            if attempt < retries:
+                sleep_seconds = min(
+                    attempt * 5,
+                    30,
                 )
 
                 log(
                     f"Retrying in "
-                    f"{wait} seconds..."
+                    f"{sleep_seconds}s..."
                 )
 
                 time.sleep(
-                    wait
+                    sleep_seconds
                 )
 
-    fail(
-        f"Unable to download: {url}"
+    raise RuntimeError(
+        f"Download failed after "
+        f"{retries} attempts: {last_error}"
     )
 
 
@@ -434,20 +374,9 @@ def download_file(
 # ============================================================
 
 def download_western_zone():
-
-    if (
-        SOURCE_OSM.exists()
-        and SOURCE_OSM.stat().st_size
-        > 100 * 1024 * 1024
-    ):
-        log(
-            "Western Zone source already exists."
-        )
-        return
-
-    download_file(
+    return download_file(
         WESTERN_ZONE_URL,
-        SOURCE_OSM,
+        SOURCE_OSM_PATH,
     )
 
 
@@ -456,53 +385,54 @@ def download_western_zone():
 # ============================================================
 
 def extract_pune_osm():
+    section("EXTRACTING PUNE OSM")
 
-    if FINAL_OSM.exists():
-        FINAL_OSM.unlink()
+    ensure_directory(
+        PUNE_OSM_PATH.parent
+    )
 
-    xmin, ymin, xmax, ymax = (
+    min_lon, min_lat, max_lon, max_lat = (
         PUNE_BBOX
     )
 
     bbox = (
-        f"{xmin},"
-        f"{ymin},"
-        f"{xmax},"
-        f"{ymax}"
+        f"{min_lon},"
+        f"{min_lat},"
+        f"{max_lon},"
+        f"{max_lat}"
     )
 
-    run_command(
-        [
-            "osmium",
-            "extract",
-            "--bbox",
-            bbox,
-            "--strategy",
-            "smart",
-            str(SOURCE_OSM),
-            "-o",
-            str(FINAL_OSM),
-            "--overwrite",
-        ],
-        "EXTRACTING PUNE OSM",
-    )
+    command = [
+        "osmium",
+        "extract",
+        "--bbox",
+        bbox,
+        "--strategy",
+        "smart",
+        str(SOURCE_OSM_PATH),
+        "-o",
+        str(PUNE_OSM_PATH),
+        "--overwrite",
+    ]
 
-    if not FINAL_OSM.exists():
-        fail(
-            "Pune OSM was not created."
+    run_command(command)
+
+    if not PUNE_OSM_PATH.exists():
+        raise RuntimeError(
+            "Pune PBF was not created."
         )
 
-    size = FINAL_OSM.stat().st_size
+    size = PUNE_OSM_PATH.stat().st_size
 
     log(
         f"Pune PBF size: "
         f"{human_size(size)}"
     )
 
-    if size < 100_000:
-        fail(
-            "Extracted Pune PBF is "
-            "suspiciously small."
+    if size < MIN_PUNE_OSM_SIZE:
+        raise RuntimeError(
+            "Pune PBF is suspiciously small: "
+            f"{size} bytes"
         )
 
 
@@ -511,137 +441,179 @@ def extract_pune_osm():
 # ============================================================
 
 def get_osm_fileinfo():
+    section("OSMIUM FILEINFO")
 
-    return run_command(
+    result = run_command(
         [
             "osmium",
             "fileinfo",
             "--extended",
-            str(FINAL_OSM),
+            str(PUNE_OSM_PATH),
         ],
-        "OSMIUM FILEINFO",
+        capture_output=True,
     )
 
+    log(result.stdout)
+
+    return result.stdout
+
+
+def parse_osm_counts(fileinfo):
+    patterns = {
+        "nodes": r"Number of nodes:\s*([\d,]+)",
+        "ways": r"Number of ways:\s*([\d,]+)",
+        "relations": r"Number of relations:\s*([\d,]+)",
+    }
+
+    counts = {}
+
+    for key, pattern in patterns.items():
+        match = re.search(
+            pattern,
+            fileinfo,
+        )
+
+        if match:
+            counts[key] = int(
+                match.group(1).replace(",", "")
+            )
+        else:
+            counts[key] = 0
+
+    return counts
+
 
 # ============================================================
-# COORDINATE EXTRACTION
+# GEOJSON COORDINATE EXTRACTION
 # ============================================================
 
-def find_coordinate(
-    value,
-):
+def find_coordinates(value):
+    """
+    Recursively find coordinate pairs from
+    GeoJSON coordinates.
+
+    Supports:
+      [lon, lat]
+      [[lon, lat], ...]
+      nested MultiLineString / MultiPolygon
+    """
+
+    if not isinstance(value, list):
+        return
 
     if (
-        isinstance(value, list)
-        and len(value) >= 2
-        and isinstance(
-            value[0],
-            (int, float),
-        )
-        and isinstance(
-            value[1],
-            (int, float),
-        )
+        len(value) >= 2
+        and isinstance(value[0], (int, float))
+        and isinstance(value[1], (int, float))
     ):
-        return (
+        yield (
             float(value[0]),
             float(value[1]),
         )
+        return
 
-    if isinstance(
-        value,
-        list,
-    ):
-
-        for item in value:
-
-            result = (
-                find_coordinate(
-                    item
-                )
-            )
-
-            if result:
-                return result
-
-    return None
+    for item in value:
+        yield from find_coordinates(item)
 
 
-# ============================================================
-# OSM GEOMETRY VALIDATION
-# ============================================================
-
-def validate_osm_geometry():
-
-    diagnostic = (
-        TMP_DIR /
-        "pune-diagnostic.geojsonseq"
-    )
-
-    if diagnostic.exists():
-        diagnostic.unlink()
-
-    # IMPORTANT:
-    # Do NOT use --output-header.
-    # osmium 1.16 does not support it.
-
-    run_command(
-        [
-            "osmium",
-            "export",
-            str(FINAL_OSM),
-            "-o",
-            str(diagnostic),
-            "--overwrite",
-            "--output-format=geojsonseq",
-            "--geometry-types",
-            "points,linestring,polygon",
-        ],
-        "PUNE GEOMETRY DIAGNOSTIC",
-    )
-
-    if (
-        not diagnostic.exists()
-        or diagnostic.stat().st_size == 0
-    ):
-        fail(
-            "Diagnostic GeoJSONSeq "
-            "is empty."
-        )
-
-    xmin, ymin, xmax, ymax = (
+def coordinate_inside_pune(
+    lon,
+    lat,
+):
+    min_lon, min_lat, max_lon, max_lat = (
         PUNE_BBOX
     )
 
-    total_samples = 0
-    inside_samples = 0
+    return (
+        min_lon <= lon <= max_lon
+        and
+        min_lat <= lat <= max_lat
+    )
 
-    outside_samples = 0
 
-    first_inside = None
+# ============================================================
+# GEOMETRY VALIDATION
+# ============================================================
 
-    with diagnostic.open(
+def validate_osm_geometry():
+    section("PUNE GEOMETRY DIAGNOSTIC")
+
+    ensure_directory(
+        DIAGNOSTIC_PATH.parent
+    )
+
+    if DIAGNOSTIC_PATH.exists():
+        DIAGNOSTIC_PATH.unlink()
+
+    # IMPORTANT:
+    # osmium 1.16.0 does NOT accept "points"
+    # here. Valid geometry types needed for
+    # our processor are linestring and polygon.
+    command = [
+        "osmium",
+        "export",
+        str(PUNE_OSM_PATH),
+        "-o",
+        str(DIAGNOSTIC_PATH),
+        "--overwrite",
+        "--output-format=geojsonseq",
+        "--geometry-types",
+        "linestring,polygon",
+    ]
+
+    run_command(command)
+
+    if not DIAGNOSTIC_PATH.exists():
+        raise RuntimeError(
+            "Diagnostic GeoJSONSeq was not created."
+        )
+
+    size = DIAGNOSTIC_PATH.stat().st_size
+
+    log(
+        "Diagnostic size: "
+        f"{human_size(size)}"
+    )
+
+    if size == 0:
+        raise RuntimeError(
+            "Diagnostic GeoJSONSeq is empty."
+        )
+
+    min_lon, min_lat, max_lon, max_lat = (
+        PUNE_BBOX
+    )
+
+    total_features = 0
+    total_coordinates = 0
+    inside_coordinates = 0
+
+    samples = []
+
+    with open(
+        DIAGNOSTIC_PATH,
         "r",
         encoding="utf-8",
-    ) as file:
+    ) as f:
 
-        for raw_line in file:
-
-            line = raw_line.strip()
+        for line_number, line in enumerate(
+            f,
+            start=1,
+        ):
+            line = line.strip()
 
             if not line:
                 continue
 
-            line = line.lstrip(
-                "\x1e"
-            )
-
             try:
-                feature = json.loads(
-                    line
+                feature = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "Invalid GeoJSONSeq at "
+                    f"line {line_number}: {exc}"
                 )
-            except Exception:
-                continue
+
+            total_features += 1
 
             geometry = feature.get(
                 "geometry"
@@ -654,99 +626,90 @@ def validate_osm_geometry():
                 "coordinates"
             )
 
-            coordinate = (
-                find_coordinate(
-                    coordinates
-                )
-            )
-
-            if not coordinate:
+            if coordinates is None:
                 continue
 
-            lon, lat = coordinate
-
-            total_samples += 1
-
-            is_inside = (
-                xmin <= lon <= xmax
-                and
-                ymin <= lat <= ymax
-            )
-
-            if is_inside:
-
-                inside_samples += 1
-
-                if first_inside is None:
-                    first_inside = (
-                        lon,
-                        lat,
-                    )
-
-            else:
-                outside_samples += 1
-
-            if (
-                total_samples <= 20
+            for lon, lat in find_coordinates(
+                coordinates
             ):
+                total_coordinates += 1
 
-                log(
-                    f"Sample "
-                    f"{total_samples}: "
-                    f"lon={lon}, "
-                    f"lat={lat}, "
-                    f"inside={is_inside}"
+                inside = coordinate_inside_pune(
+                    lon,
+                    lat,
                 )
 
-            # We already have enough
-            # evidence after 100 samples.
-            if (
-                total_samples >= 100
-                and inside_samples >= 10
-            ):
+                if inside:
+                    inside_coordinates += 1
+
+                if len(samples) < 20:
+                    samples.append(
+                        {
+                            "lon": lon,
+                            "lat": lat,
+                            "inside": inside,
+                        }
+                    )
+
+                # Once we have enough evidence
+                # that the extracted geometry is
+                # actually inside Pune, we don't
+                # need to parse the entire file.
+                if inside_coordinates >= 10:
+                    break
+
+            if inside_coordinates >= 10:
                 break
 
-    log()
     log(
-        f"Total samples: "
-        f"{total_samples}"
+        f"Features inspected: "
+        f"{total_features}"
     )
 
     log(
-        f"Inside Pune: "
-        f"{inside_samples}"
+        f"Coordinates inspected: "
+        f"{total_coordinates}"
     )
 
     log(
-        f"Outside Pune: "
-        f"{outside_samples}"
+        f"Coordinates inside Pune bbox: "
+        f"{inside_coordinates}"
     )
 
-    if (
-        total_samples == 0
-        or inside_samples == 0
+    log("")
+    log("SAMPLE COORDINATES")
+
+    for index, sample in enumerate(
+        samples,
+        start=1,
     ):
-        fail(
-            "PUNE GEOMETRY VALIDATION FAILED. "
-            "No geometry sample was found "
-            "inside the Pune bbox."
+        log(
+            f"Sample {index}: "
+            f"lon={sample['lon']:.7f}, "
+            f"lat={sample['lat']:.7f}, "
+            f"inside={sample['inside']}"
         )
 
-    if first_inside:
-        log()
-        log(
-            "First Pune coordinate:"
-        )
-        log(
-            f"longitude = "
-            f"{first_inside[0]}"
-        )
-        log(
-            f"latitude  = "
-            f"{first_inside[1]}"
+    if total_features == 0:
+        raise RuntimeError(
+            "No line/polygon geometries were "
+            "exported from the Pune PBF."
         )
 
-    log()
+    if total_coordinates == 0:
+        raise RuntimeError(
+            "No coordinates were found in "
+            "diagnostic geometry."
+        )
+
+    if inside_coordinates == 0:
+        raise RuntimeError(
+            "ZERO geometry coordinates were "
+            "inside the Pune bbox. "
+            "The source/extraction is invalid."
+        )
+
+    log("")
     log(
         "PUNE GEOMETRY VALIDATION PASSED"
     )
@@ -757,114 +720,89 @@ def validate_osm_geometry():
 # ============================================================
 
 def validate_osm():
+    section("VALIDATING PUNE OSM")
 
-    log()
-    log("=" * 70)
-    log("VALIDATING PUNE OSM")
-    log("=" * 70)
+    fileinfo = get_osm_fileinfo()
 
-    fileinfo = (
-        get_osm_fileinfo()
+    counts = parse_osm_counts(
+        fileinfo
     )
 
-    lower = fileinfo.lower()
-
-    node_match = re.search(
-        r"number of nodes:\s*([0-9]+)",
-        lower,
-    )
-
-    way_match = re.search(
-        r"number of ways:\s*([0-9]+)",
-        lower,
-    )
-
-    relation_match = re.search(
-        r"number of relations:\s*([0-9]+)",
-        lower,
-    )
-
-    nodes = (
-        int(
-            node_match.group(1)
-        )
-        if node_match
-        else 0
-    )
-
-    ways = (
-        int(
-            way_match.group(1)
-        )
-        if way_match
-        else 0
-    )
-
-    relations = (
-        int(
-            relation_match.group(1)
-        )
-        if relation_match
-        else 0
-    )
-
-    log()
     log(
         f"Nodes      : "
-        f"{nodes:,}"
+        f"{counts['nodes']:,}"
     )
 
     log(
         f"Ways       : "
-        f"{ways:,}"
+        f"{counts['ways']:,}"
     )
 
     log(
         f"Relations   : "
-        f"{relations:,}"
+        f"{counts['relations']:,}"
     )
 
-    if nodes <= 0:
-        fail(
-            "Pune PBF contains "
-            "zero nodes."
+    if (
+        counts["nodes"]
+        < MIN_EXPECTED_NODES
+    ):
+        raise RuntimeError(
+            "Too few OSM nodes."
         )
 
-    if ways <= 0:
-        fail(
-            "Pune PBF contains "
-            "zero ways."
+    if (
+        counts["ways"]
+        < MIN_EXPECTED_WAYS
+    ):
+        raise RuntimeError(
+            "Too few OSM ways."
+        )
+
+    if (
+        counts["relations"]
+        < MIN_EXPECTED_RELATIONS
+    ):
+        log(
+            "WARNING: No relations found."
         )
 
     validate_osm_geometry()
+
+    return counts
 
 
 # ============================================================
 # DEM
 # ============================================================
 
-def collect_dem(
-    manifest,
-):
+def collect_dem():
+    section("COLLECTING DEM")
 
-    log()
-    log("=" * 70)
-    log("COLLECTING DEM")
-    log("=" * 70)
+    ensure_directory(
+        DEM_DIR
+    )
 
-    for tile in DEM_TILES:
-
-        latitude = tile[:3]
-
-        url = (
-            f"{DEM_BASE_URL}/"
-            f"{latitude}/"
-            f"{tile}.hgt.gz"
-        )
+    for tile_name, url in DEM_TILES.items():
 
         output = (
             DEM_DIR /
-            f"{tile}.hgt.gz"
+            f"{tile_name}.hgt.gz"
+        )
+
+        if (
+            output.exists()
+            and output.stat().st_size > 0
+        ):
+            log(
+                f"Already exists: "
+                f"{output}"
+            )
+            continue
+
+        log(
+            f"Downloading DEM: "
+            f"{tile_name}"
         )
 
         download_file(
@@ -872,218 +810,227 @@ def collect_dem(
             output,
         )
 
-        manifest.append(
-            {
-                "type":
-                    "dem",
-                "tile":
-                    tile,
-                "url":
-                    url,
-                "file":
-                    str(output),
-                "size":
-                    output.stat().st_size,
-                "sha256":
-                    sha256_file(
-                        output
-                    ),
-            }
-        )
+    log("DEM collection complete.")
 
 
 # ============================================================
-# OPENCITY
+# OPENCITY API
 # ============================================================
 
 def opencity_request(
     params,
+    retries=3,
 ):
+    last_error = None
 
     for attempt in range(
         1,
-        MAX_RETRIES + 1,
+        retries + 1,
     ):
-
         try:
-
-            response = session.get(
+            response = requests.get(
                 OPENCITY_API,
                 params=params,
-                timeout=(
-                    CONNECT_TIMEOUT,
-                    300,
-                ),
+                timeout=REQUEST_TIMEOUT,
+                headers={
+                    "User-Agent":
+                        "PuneRawCollector/2.2"
+                },
             )
 
             response.raise_for_status()
 
             data = response.json()
 
-            if not data.get(
-                "success"
-            ):
+            if not data.get("success"):
                 raise RuntimeError(
-                    "OpenCity API "
+                    "OpenCity API returned "
                     "success=false"
                 )
 
-            return data
+            return data["result"]
 
         except Exception as exc:
+            last_error = exc
 
             log(
-                f"OpenCity attempt "
-                f"{attempt} failed: "
+                "OpenCity request failed: "
                 f"{exc}"
             )
 
-            if attempt < MAX_RETRIES:
-
+            if attempt < retries:
                 time.sleep(
-                    min(
-                        10 * attempt,
-                        60,
-                    )
+                    attempt * 3
                 )
 
-    fail(
-        "OpenCity API failed."
+    raise RuntimeError(
+        "OpenCity API request failed: "
+        f"{last_error}"
     )
 
 
+# ============================================================
+# OPENCITY CATALOG
+# ============================================================
+
 def collect_opencity_catalog():
+    section("COLLECTING OPENCITY CATALOG")
 
-    log()
-    log("=" * 70)
-    log("COLLECTING OPENCITY CATALOG")
-    log("=" * 70)
+    ensure_directory(
+        OPENCITY_DIR
+    )
 
-    datasets = []
+    result = opencity_request(
+        {
+            "q": "",
+            "rows": 1000,
+            "organization":
+                OPENCITY_ORG,
+        }
+    )
 
-    start = 0
-    rows = 100
-
-    while True:
-
-        data = opencity_request(
-            {
-                "fq":
-                    f"organization:"
-                    f"{OPENCITY_ORG}",
-                "rows":
-                    rows,
-                "start":
-                    start,
-            }
-        )
-
-        result = data.get(
-            "result",
-            {},
-        )
-
-        current = result.get(
-            "results",
-            [],
-        )
-
-        if not current:
-            break
-
-        datasets.extend(
-            current
-        )
-
-        total = int(
-            result.get(
-                "count",
-                len(datasets),
-            )
-        )
-
-        log(
-            f"Datasets: "
-            f"{len(datasets)}/"
-            f"{total}"
-        )
-
-        start += len(
-            current
-        )
-
-        if start >= total:
-            break
-
-    catalog = {
-        "success": True,
-        "result": {
-            "count":
-                len(datasets),
-            "results":
-                datasets,
-        },
-    }
-
-    output = (
+    catalog_path = (
         OPENCITY_DIR /
         "package_search.json"
     )
 
-    output.write_text(
-        json.dumps(
-            catalog,
+    with open(
+        catalog_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            result,
+            f,
             indent=2,
             ensure_ascii=False,
-        ),
-        encoding="utf-8",
+        )
+
+    log(
+        f"OpenCity packages: "
+        f"{len(result.get('results', []))}"
     )
 
-    return catalog
+    return result
+
+
+# ============================================================
+# OPENCITY RESOURCE DOWNLOAD
+# ============================================================
+
+def safe_filename(name):
+    name = str(name)
+
+    name = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        name,
+    )
+
+    name = name.strip(
+        "._"
+    )
+
+    if not name:
+        name = "resource"
+
+    return name[:180]
+
+
+def resource_extension(
+    resource,
+):
+    fmt = str(
+        resource.get(
+            "format",
+            ""
+        )
+    ).upper().strip()
+
+    if fmt:
+        fmt_clean = re.sub(
+            r"[^A-Z0-9]+",
+            "",
+            fmt,
+        )
+
+        if fmt_clean == "GEOJSON":
+            return ".geojson"
+
+        return "." + fmt_clean.lower()
+
+    url = resource.get(
+        "url",
+        ""
+    )
+
+    parsed = urlparse(url)
+
+    suffix = Path(
+        parsed.path
+    ).suffix
+
+    return suffix.lower()
 
 
 def collect_opencity_resources(
     catalog,
-    manifest,
 ):
+    section("COLLECTING OPENCITY RESOURCES")
 
-    datasets = (
-        catalog
-        .get("result", {})
-        .get("results", [])
+    resources_root = (
+        OPENCITY_DIR /
+        "resources"
     )
 
-    seen = set()
+    ensure_directory(
+        resources_root
+    )
 
-    for dataset in datasets:
+    packages = catalog.get(
+        "results",
+        []
+    )
 
-        title = dataset.get(
-            "title",
-            "dataset",
+    downloaded = 0
+    skipped = 0
+    failed = 0
+
+    for package_index, package in enumerate(
+        packages,
+        start=1,
+    ):
+
+        package_name = safe_filename(
+            package.get(
+                "name",
+                f"package_{package_index}",
+            )
         )
 
-        resources = dataset.get(
+        package_dir = (
+            resources_root /
+            package_name
+        )
+
+        ensure_directory(
+            package_dir
+        )
+
+        resources = package.get(
             "resources",
-            [],
+            []
         )
 
-        slug = re.sub(
-            r"[^A-Za-z0-9_-]+",
-            "_",
-            title.lower(),
-        )[:100]
-
-        directory = (
-            OPENCITY_DIR /
-            slug
+        log(
+            f"[{package_index}/"
+            f"{len(packages)}] "
+            f"{package_name} "
+            f"resources={len(resources)}"
         )
 
-        directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        for index, resource in enumerate(
+        for resource_index, resource in enumerate(
             resources,
             start=1,
         ):
@@ -1093,79 +1040,99 @@ def collect_opencity_resources(
             )
 
             if not url:
+                skipped += 1
                 continue
-
-            if url in seen:
-                continue
-
-            seen.add(
-                url
-            )
 
             fmt = str(
                 resource.get(
                     "format",
-                    "",
+                    ""
                 )
             ).upper().strip()
 
             if (
                 fmt
-                and fmt
-                not in ALLOWED_FORMATS
+                and fmt not in ALLOWED_FORMATS
             ):
+                skipped += 1
                 continue
 
-            filename = safe_filename(
-                url,
-                f"resource-{index}",
+            resource_name = resource.get(
+                "name"
+            ) or resource.get(
+                "id"
+            ) or f"resource_{resource_index}"
+
+            resource_name = safe_filename(
+                resource_name
             )
+
+            extension = resource_extension(
+                resource
+            )
+
+            if extension:
+                if not resource_name.lower().endswith(
+                    extension.lower()
+                ):
+                    resource_name += extension
 
             output = (
-                directory /
-                filename
+                package_dir /
+                resource_name
             )
 
-            try:
+            if (
+                output.exists()
+                and output.stat().st_size > 0
+            ):
+                skipped += 1
+                continue
 
+            try:
                 download_file(
                     url,
                     output,
+                    retries=3,
                 )
 
+                downloaded += 1
+
             except Exception as exc:
+                failed += 1
 
                 log(
-                    "WARNING: "
+                    "WARNING: OpenCity resource "
+                    "failed: "
                     f"{url}"
                 )
 
                 log(
-                    repr(exc)
+                    f"Reason: {exc}"
                 )
 
-                continue
+    log("")
+    log(
+        "OpenCity resource summary:"
+    )
+    log(
+        f"Downloaded: {downloaded}"
+    )
+    log(
+        f"Skipped:    {skipped}"
+    )
+    log(
+        f"Failed:    {failed}"
+    )
 
-            manifest.append(
-                {
-                    "type":
-                        "opencity",
-                    "dataset":
-                        title,
-                    "format":
-                        fmt,
-                    "url":
-                        url,
-                    "file":
-                        str(output),
-                    "size":
-                        output.stat().st_size,
-                    "sha256":
-                        sha256_file(
-                            output
-                        ),
-                }
-            )
+    # Resource failures should not destroy
+    # the entire raw collection. The catalog
+    # itself is still preserved.
+    if failed:
+        log(
+            "WARNING: Some OpenCity resources "
+            "could not be downloaded."
+        )
 
 
 # ============================================================
@@ -1173,88 +1140,142 @@ def collect_opencity_resources(
 # ============================================================
 
 def create_manifest(
-    manifest,
+    osm_counts,
 ):
+    section("CREATING MANIFEST")
 
-    output = (
-        RELEASE_DIR /
-        "manifest.json"
-    )
+    files = []
 
-    data = {
-        "project":
-            "Pune Raw Open Data",
-        "version":
-            VERSION,
-        "release_tag":
-            RELEASE_TAG,
-        "generated_at":
-            time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ",
-                time.gmtime(),
-            ),
-        "bbox": {
-            "xmin":
-                PUNE_BBOX[0],
-            "ymin":
-                PUNE_BBOX[1],
-            "xmax":
-                PUNE_BBOX[2],
-            "ymax":
-                PUNE_BBOX[3],
+    for root in [
+        Path("data/raw"),
+    ]:
+
+        if not root.exists():
+            continue
+
+        for path in root.rglob("*"):
+
+            if not path.is_file():
+                continue
+
+            relative = path.as_posix()
+
+            files.append(
+                {
+                    "path": relative,
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(
+                        path
+                    ),
+                }
+            )
+
+    manifest = {
+        "collector_version": VERSION,
+        "release_tag": RELEASE_TAG,
+        "release_name": RELEASE_NAME,
+        "generated_at_utc": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(),
+        ),
+        "pune_bbox": {
+            "min_lon": PUNE_BBOX[0],
+            "min_lat": PUNE_BBOX[1],
+            "max_lon": PUNE_BBOX[2],
+            "max_lat": PUNE_BBOX[3],
         },
-        "osm_source":
-            WESTERN_ZONE_URL,
-        "files":
-            manifest,
+        "osm": {
+            "source": WESTERN_ZONE_URL,
+            "source_file":
+                str(SOURCE_OSM_PATH),
+            "pune_file":
+                str(PUNE_OSM_PATH),
+            "nodes":
+                osm_counts["nodes"],
+            "ways":
+                osm_counts["ways"],
+            "relations":
+                osm_counts["relations"],
+        },
+        "files": files,
     }
 
-    output.write_text(
-        json.dumps(
-            data,
+    ensure_directory(
+        MANIFEST_PATH.parent
+    )
+
+    with open(
+        MANIFEST_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            manifest,
+            f,
             indent=2,
             ensure_ascii=False,
-        ),
-        encoding="utf-8",
+        )
+
+    log(
+        f"Manifest files: "
+        f"{len(files)}"
     )
 
-    return output
 
+# ============================================================
+# CHECKSUMS
+# ============================================================
 
-def create_checksums(
-    manifest,
-):
-
-    output = (
-        RELEASE_DIR /
-        "SHA256SUMS.txt"
-    )
+def create_checksums():
+    section("CREATING SHA256 CHECKSUMS")
 
     lines = []
 
-    for item in manifest:
+    for root in [
+        Path("data/raw"),
+    ]:
 
-        checksum = item.get(
-            "sha256"
-        )
+        if not root.exists():
+            continue
 
-        path = item.get(
-            "file"
-        )
+        for path in sorted(
+            root.rglob("*")
+        ):
 
-        if checksum and path:
-            lines.append(
-                f"{checksum}  "
-                f"{Path(path).as_posix()}"
+            if not path.is_file():
+                continue
+
+            digest = sha256_file(
+                path
             )
 
-    output.write_text(
-        "\n".join(lines)
-        + "\n",
-        encoding="utf-8",
+            lines.append(
+                f"{digest}  "
+                f"{path.as_posix()}"
+            )
+
+    ensure_directory(
+        CHECKSUM_PATH.parent
     )
 
-    return output
+    with open(
+        CHECKSUM_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        f.write(
+            "\n".join(lines)
+        )
+
+        if lines:
+            f.write("\n")
+
+    log(
+        f"Checksum entries: "
+        f"{len(lines)}"
+    )
 
 
 # ============================================================
@@ -1262,6 +1283,7 @@ def create_checksums(
 # ============================================================
 
 def ensure_release():
+    section("GITHUB RELEASE")
 
     result = subprocess.run(
         [
@@ -1270,6 +1292,7 @@ def ensure_release():
             "view",
             RELEASE_TAG,
         ],
+        check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1281,6 +1304,11 @@ def ensure_release():
         )
         return
 
+    log(
+        f"Creating release: "
+        f"{RELEASE_TAG}"
+    )
+
     run_command(
         [
             "gh",
@@ -1291,28 +1319,23 @@ def ensure_release():
             RELEASE_NAME,
             "--notes",
             (
-                "Fresh Pune raw open data. "
-                "Pune OSM extracted from "
-                "Geofabrik Western Zone "
-                "and geographically validated."
+                "Pune raw open-data collection "
+                f"v{VERSION}."
             ),
-        ],
-        "CREATING RELEASE",
+        ]
     )
 
 
-def upload_asset(
-    path,
-):
+def upload_asset(path):
+    path = Path(path)
 
-    if (
-        not path.exists()
-        or path.stat().st_size == 0
-    ):
-        fail(
-            f"Invalid release asset: "
-            f"{path}"
-        )
+    if not path.exists():
+        return
+
+    log(
+        f"Uploading release asset: "
+        f"{path}"
+    )
 
     run_command(
         [
@@ -1322,9 +1345,75 @@ def upload_asset(
             RELEASE_TAG,
             str(path),
             "--clobber",
-        ],
-        f"UPLOADING {path.name}",
+        ]
     )
+
+
+def upload_release_assets():
+    section("UPLOADING RELEASE ASSETS")
+
+    # Main Pune OSM
+    upload_asset(
+        PUNE_OSM_PATH
+    )
+
+    # DEM
+    if DEM_DIR.exists():
+
+        for path in sorted(
+            DEM_DIR.iterdir()
+        ):
+
+            if path.is_file():
+                upload_asset(
+                    path
+                )
+
+    # OpenCity catalog
+    catalog = (
+        OPENCITY_DIR /
+        "package_search.json"
+    )
+
+    if catalog.exists():
+        upload_asset(
+            catalog
+        )
+
+    # Manifest
+    upload_asset(
+        MANIFEST_PATH
+    )
+
+    # Checksums
+    upload_asset(
+        CHECKSUM_PATH
+    )
+
+    log(
+        "Release upload complete."
+    )
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+def cleanup_source_file():
+    """
+    The Western Zone PBF is only an intermediate
+    source. Keep it locally during processing,
+    but do not upload it as the Pune raw release
+    asset.
+    """
+
+    if SOURCE_OSM_PATH.exists():
+        log(
+            "Removing intermediate "
+            "Western Zone source PBF..."
+        )
+
+        SOURCE_OSM_PATH.unlink()
 
 
 # ============================================================
@@ -1332,228 +1421,126 @@ def upload_asset(
 # ============================================================
 
 def main():
+    start_time = time.time()
 
-    started = time.time()
-
-    log()
-    log("=" * 70)
-    log(
-        f"PUNE RAW DATA COLLECTOR "
-        f"v{VERSION}"
+    section(
+        f"PUNE RAW DATA COLLECTOR v{VERSION}"
     )
-    log("=" * 70)
 
     log(
-        f"Pune bbox: "
-        f"{PUNE_BBOX}"
+        f"Pune bbox: {PUNE_BBOX}"
     )
 
-    for command in (
-        "osmium",
-        "gh",
-    ):
-
-        if shutil.which(
-            command
-        ) is None:
-
-            fail(
-                f"Missing command: "
-                f"{command}"
-            )
-
-    if not os.environ.get(
-        "GH_TOKEN"
-    ):
-        fail(
-            "GH_TOKEN is not set."
+    try:
+        ensure_directory(
+            Path("data/raw")
         )
 
-    # --------------------------------------------------------
-    # Clean temporary directory only.
-    # --------------------------------------------------------
-
-    if TMP_DIR.exists():
-        shutil.rmtree(
-            TMP_DIR
+        ensure_directory(
+            Path("data/tmp")
         )
 
-    TMP_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+        ensure_release()
 
-    # --------------------------------------------------------
-    # Release
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # 1. Download correct Geofabrik zone
+        # ----------------------------------------------------
 
-    ensure_release()
+        download_western_zone()
 
-    manifest = []
+        # ----------------------------------------------------
+        # 2. Extract only Pune bbox
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # OSM
-    # --------------------------------------------------------
+        extract_pune_osm()
 
-    download_western_zone()
+        # ----------------------------------------------------
+        # 3. Validate OSM counts + actual geometry
+        # ----------------------------------------------------
 
-    extract_pune_osm()
+        osm_counts = validate_osm()
 
-    validate_osm()
+        # ----------------------------------------------------
+        # 4. DEM
+        # ----------------------------------------------------
 
-    manifest.append(
-        {
-            "type":
-                "osm",
-            "source":
-                "Geofabrik Western Zone",
-            "source_url":
-                WESTERN_ZONE_URL,
-            "bbox":
-                list(PUNE_BBOX),
-            "file":
-                str(FINAL_OSM),
-            "release_filename":
-                FINAL_OSM_NAME,
-            "size":
-                FINAL_OSM.stat().st_size,
-            "sha256":
-                sha256_file(
-                    FINAL_OSM
-                ),
-        }
-    )
+        collect_dem()
 
-    # --------------------------------------------------------
-    # DEM
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # 5. OpenCity catalog
+        # ----------------------------------------------------
 
-    collect_dem(
-        manifest
-    )
+        catalog = (
+            collect_opencity_catalog()
+        )
 
-    # --------------------------------------------------------
-    # OpenCity
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # 6. OpenCity resources
+        # ----------------------------------------------------
 
-    catalog = (
-        collect_opencity_catalog()
-    )
+        collect_opencity_resources(
+            catalog
+        )
 
-    collect_opencity_resources(
-        catalog,
-        manifest,
-    )
+        # ----------------------------------------------------
+        # 7. Manifest
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # Manifest
-    # --------------------------------------------------------
-
-    manifest_path = (
         create_manifest(
-            manifest
-        )
-    )
-
-    checksum_path = (
-        create_checksums(
-            manifest
-        )
-    )
-
-    # --------------------------------------------------------
-    # Upload OSM
-    # --------------------------------------------------------
-
-    upload_asset(
-        FINAL_OSM
-    )
-
-    # --------------------------------------------------------
-    # Upload DEM
-    # --------------------------------------------------------
-
-    for tile in DEM_TILES:
-
-        upload_asset(
-            DEM_DIR /
-            f"{tile}.hgt.gz"
+            osm_counts
         )
 
-    # --------------------------------------------------------
-    # Upload catalog
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # 8. SHA256
+        # ----------------------------------------------------
 
-    upload_asset(
-        OPENCITY_DIR /
-        "package_search.json"
-    )
+        create_checksums()
 
-    # --------------------------------------------------------
-    # Upload resources
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # 9. Upload release
+        # ----------------------------------------------------
 
-    for path in OPENCITY_DIR.rglob(
-        "*"
-    ):
+        upload_release_assets()
 
-        if (
-            path.is_file()
-            and path.name
-            != "package_search.json"
-        ):
+        # ----------------------------------------------------
+        # 10. Cleanup
+        # ----------------------------------------------------
 
-            upload_asset(
-                path
-            )
+        cleanup_source_file()
 
-    # --------------------------------------------------------
-    # Upload manifest
-    # --------------------------------------------------------
+        elapsed = (
+            time.time() - start_time
+        )
 
-    upload_asset(
-        manifest_path
-    )
+        section(
+            "COLLECTION COMPLETE"
+        )
 
-    upload_asset(
-        checksum_path
-    )
+        log(
+            f"Total time: "
+            f"{elapsed / 60:.1f} minutes"
+        )
 
-    # --------------------------------------------------------
-    # Final
-    # --------------------------------------------------------
+        log(
+            f"Release: "
+            f"{RELEASE_TAG}"
+        )
 
-    elapsed = (
-        time.time()
-        - started
-    )
+        log(
+            "PUNE RAW DATA COLLECTION "
+            "SUCCESSFUL"
+        )
 
-    log()
-    log("=" * 70)
-    log(
-        "PUNE RAW COLLECTION COMPLETE"
-    )
-    log("=" * 70)
+    except Exception as exc:
 
-    log(
-        f"OSM size: "
-        f"{human_size(FINAL_OSM.stat().st_size)}"
-    )
+        section("ERROR")
 
-    log(
-        f"Manifest files: "
-        f"{len(manifest)}"
-    )
+        log(
+            f"{type(exc).__name__}: "
+            f"{exc}"
+        )
 
-    log(
-        f"Elapsed: "
-        f"{elapsed / 60:.1f} minutes"
-    )
-
-    log(
-        f"Release: "
-        f"{RELEASE_TAG}"
-    )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
