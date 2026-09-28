@@ -16,7 +16,7 @@ import requests
 # CONFIG
 # ============================================================
 
-VERSION = "2.3"
+VERSION = "2.4"
 
 RELEASE_TAG = "pune-raw-v1"
 RELEASE_NAME = "Pune Raw Open Data v1"
@@ -150,44 +150,75 @@ def run_command(
     command,
     check=True,
     capture_output=False,
+    timeout=900,
 ):
-    log(
-        "$ " +
-        " ".join(
-            str(x)
-            for x in command
+    """Run a subprocess with useful CI diagnostics."""
+    command_text = " ".join(str(x) for x in command)
+
+    log("$ " + command_text)
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
         )
-    )
+    except subprocess.TimeoutExpired as exc:
+        log(f"Command TIMEOUT after {timeout}s")
 
-    result = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        capture_output=capture_output,
-    )
+        if exc.stdout:
+            log("STDOUT:")
+            log(
+                exc.stdout
+                if isinstance(exc.stdout, str)
+                else exc.stdout.decode(errors="replace")
+            )
 
-    if (
-        check
-        and result.returncode != 0
-    ):
-        log(
-            "Command failed with "
-            f"exit code {result.returncode}"
-        )
-
-        if capture_output:
-            if result.stdout:
-                log(result.stdout)
-
-            if result.stderr:
-                log(result.stderr)
+        if exc.stderr:
+            log("STDERR:")
+            log(
+                exc.stderr
+                if isinstance(exc.stderr, str)
+                else exc.stderr.decode(errors="replace")
+            )
 
         raise RuntimeError(
-            "Command failed: "
-            + " ".join(
-                map(str, command)
+            f"Command timed out after {timeout}s: {command_text}"
+        ) from exc
+
+    log(f"Command exit code: {result.returncode}")
+
+    if result.returncode != 0:
+        if result.returncode < 0:
+            log(
+                "Command terminated by signal: "
+                f"{-result.returncode}"
             )
-        )
+
+        if result.stdout:
+            log("STDOUT:")
+            log(result.stdout)
+
+        if result.stderr:
+            log("STDERR:")
+            log(result.stderr)
+
+        if check:
+            raise RuntimeError(
+                "Command failed with exit code "
+                f"{result.returncode}: {command_text}"
+            )
+
+    elif capture_output:
+        if result.stdout:
+            log("STDOUT:")
+            log(result.stdout)
+
+        if result.stderr:
+            log("STDERR:")
+            log(result.stderr)
 
     return result
 
@@ -533,32 +564,43 @@ def extract_pune_osm():
             f"{size} bytes"
         )
 
+    log(
+        "Pune PBF validation: "
+        "file exists and size is valid."
+    )
+
 
 # ============================================================
 # OSM FILEINFO
 # ============================================================
 
 def get_osm_fileinfo():
+    """
+    Lightweight OSM validation.
 
-    section(
-        "OSMIUM FILEINFO"
-    )
+    Avoid `osmium fileinfo --extended` in the CI validation path.
+    """
+    section("OSMIUM FILEINFO")
 
     result = run_command(
         [
             "osmium",
             "fileinfo",
-            "--extended",
             str(PUNE_OSM_PATH),
         ],
         capture_output=True,
+        timeout=180,
     )
 
-    log(
-        result.stdout
-    )
+    output = result.stdout or ""
 
-    return result.stdout
+    if not output.strip():
+        raise RuntimeError(
+            "osmium fileinfo returned no output."
+        )
+
+    log(output)
+    return output
 
 
 def parse_osm_counts(
@@ -705,7 +747,8 @@ def validate_osm_geometry():
     ]
 
     run_command(
-        command
+        command,
+        timeout=900,
     )
 
     if not DIAGNOSTIC_PATH.exists():
