@@ -16,7 +16,7 @@ import requests
 # CONFIG
 # ============================================================
 
-VERSION = "2.4"
+VERSION = "2.5"
 
 RELEASE_TAG = "pune-raw-v1"
 RELEASE_NAME = "Pune Raw Open Data v1"
@@ -329,7 +329,7 @@ def download_file(
                 timeout=REQUEST_TIMEOUT,
                 headers={
                     "User-Agent":
-                        "PuneRawCollector/2.3"
+                        "PuneRawCollector/2.5"
                 },
             ) as response:
 
@@ -574,72 +574,6 @@ def extract_pune_osm():
 # OSM FILEINFO
 # ============================================================
 
-def get_osm_fileinfo():
-    """
-    Lightweight OSM validation.
-
-    Avoid `osmium fileinfo --extended` in the CI validation path.
-    """
-    section("OSMIUM FILEINFO")
-
-    result = run_command(
-        [
-            "osmium",
-            "fileinfo",
-            str(PUNE_OSM_PATH),
-        ],
-        capture_output=True,
-        timeout=180,
-    )
-
-    output = result.stdout or ""
-
-    if not output.strip():
-        raise RuntimeError(
-            "osmium fileinfo returned no output."
-        )
-
-    log(output)
-    return output
-
-
-def parse_osm_counts(
-    fileinfo
-):
-
-    patterns = {
-        "nodes":
-            r"Number of nodes:\s*([\d,]+)",
-
-        "ways":
-            r"Number of ways:\s*([\d,]+)",
-
-        "relations":
-            r"Number of relations:\s*([\d,]+)",
-    }
-
-    counts = {}
-
-    for key, pattern in patterns.items():
-
-        match = re.search(
-            pattern,
-            fileinfo,
-        )
-
-        if match:
-            counts[key] = int(
-                match.group(
-                    1
-                ).replace(
-                    ",",
-                    "",
-                )
-            )
-        else:
-            counts[key] = 0
-
-    return counts
 
 
 # ============================================================
@@ -929,63 +863,42 @@ def validate_osm_geometry():
 # ============================================================
 
 def validate_osm():
+    """
+    Validate the extracted Pune PBF without running `osmium fileinfo`.
 
-    section(
-        "VALIDATING PUNE OSM"
-    )
+    The decisive test is whether osmium can export actual line/polygon
+    geometry and whether that geometry contains coordinates inside Pune.
+    """
+    section("VALIDATING PUNE OSM")
 
-    fileinfo = (
-        get_osm_fileinfo()
-    )
-
-    counts = (
-        parse_osm_counts(
-            fileinfo
-        )
-    )
-
-    log(
-        "Nodes      : "
-        f"{counts['nodes']:,}"
-    )
-
-    log(
-        "Ways       : "
-        f"{counts['ways']:,}"
-    )
-
-    log(
-        "Relations   : "
-        f"{counts['relations']:,}"
-    )
-
-    if (
-        counts["nodes"]
-        < MIN_EXPECTED_NODES
-    ):
+    if not PUNE_OSM_PATH.exists():
         raise RuntimeError(
-            "Too few OSM nodes."
+            "Pune OSM file does not exist."
         )
 
-    if (
-        counts["ways"]
-        < MIN_EXPECTED_WAYS
-    ):
+    size = PUNE_OSM_PATH.stat().st_size
+
+    log(
+        "Pune PBF size: "
+        + human_size(size)
+    )
+
+    if size < MIN_PUNE_OSM_SIZE:
         raise RuntimeError(
-            "Too few OSM ways."
+            "Pune PBF is suspiciously small: "
+            f"{size} bytes"
         )
 
-    if (
-        counts["relations"]
-        < MIN_EXPECTED_RELATIONS
-    ):
-        log(
-            "WARNING: No relations found."
-        )
+    log("Pune PBF size validation PASSED.")
 
     validate_osm_geometry()
 
-    return counts
+    # Counts are deliberately not fabricated because fileinfo is disabled.
+    return {
+        "nodes": None,
+        "ways": None,
+        "relations": None,
+    }
 
 
 # ============================================================
@@ -1062,7 +975,7 @@ def opencity_request(
                 timeout=REQUEST_TIMEOUT,
                 headers={
                     "User-Agent":
-                        "PuneRawCollector/2.3"
+                        "PuneRawCollector/2.5"
                 },
             )
 
@@ -1628,13 +1541,17 @@ def create_manifest(
                 ),
 
             "nodes":
-                osm_counts["nodes"],
+                osm_counts.get("nodes"),
 
             "ways":
-                osm_counts["ways"],
+                osm_counts.get("ways"),
 
             "relations":
-                osm_counts["relations"],
+                osm_counts.get("relations"),
+
+            "counts_source":
+                "not collected; osmium fileinfo intentionally "
+                "disabled in collector v2.5",
         },
 
         "opencity": {
@@ -1922,18 +1839,30 @@ def print_final_summary(
     )
 
     log(
-        f"  Nodes     : "
-        f"{osm_counts['nodes']:,}"
+        "  Nodes     : "
+        + (
+            f"{osm_counts['nodes']:,}"
+            if osm_counts.get("nodes") is not None
+            else "not collected"
+        )
     )
 
     log(
-        f"  Ways      : "
-        f"{osm_counts['ways']:,}"
+        "  Ways      : "
+        + (
+            f"{osm_counts['ways']:,}"
+            if osm_counts.get("ways") is not None
+            else "not collected"
+        )
     )
 
     log(
-        f"  Relations : "
-        f"{osm_counts['relations']:,}"
+        "  Relations : "
+        + (
+            f"{osm_counts['relations']:,}"
+            if osm_counts.get("relations") is not None
+            else "not collected"
+        )
     )
 
     log("")
